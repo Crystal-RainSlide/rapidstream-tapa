@@ -130,7 +130,10 @@ MOD_DEF_IOS = []
 
 def gen_declarations(task: Task) -> tuple[list[str], list[str], list[str]]:
     """Generates kernel and port declarations."""
-    port_decl = [f"input_gmio p_{port.name};" for port in task.ports.values()]
+    port_decl = [
+        f"input_plio p_{port.name};" if port.is_immap else f"output_plio p_{port.name};"
+        for port in task.ports.values()
+    ]
     kernel_decl = [
         f"kernel k_{name}{i};"
         for name, insts in task.tasks.items()
@@ -158,7 +161,7 @@ def gen_definitions(task: Task) -> tuple[list[str], ...]:
         for i in range(len(insts))
     ]
     kernel_runtime = [
-        f"runtime<radio>(k_{name}{i}) = OCCUPANCY;"
+        f"runtime<ratio>(k_{name}{i}) = OCCUPANCY;"
         for name, insts in task.tasks.items()
         for i in range(len(insts))
     ]
@@ -168,11 +171,12 @@ def gen_definitions(task: Task) -> tuple[list[str], ...]:
         for i in range(len(insts))
     ]
 
-    burst_size = 64  # 64 Bytes
-    throughput = 1000  # 1000MB/s
     port_def = [
-        f"p_{port.name} = input_gmio::create"
-        f'("p_{port.name}", {burst_size}, {throughput});'
+        f'p_{port.name} = input_plio::create("{port.name}",'
+        f' plio_{port.width}_bits, "{port.name}.txt");'
+        if port.is_immap
+        else f'p_{port.name} = output_plio::create("{port.name}",'
+        f' plio_{port.width}_bits, "{port.name}.txt");'
         for port in task.ports.values()
     ]
     return (
@@ -460,6 +464,9 @@ int main(int argc, char ** argv)
     def get_cpp_path(self, name: str) -> str:
         return os.path.join(self.cpp_dir, name + ".cpp")
 
+    def get_common_path(self) -> str:
+        return os.path.join(self.cpp_dir, "common.h")
+
     def get_header_path(self, name: str) -> str:
         return os.path.join(self.cpp_dir, name + ".h")
 
@@ -531,7 +538,8 @@ int main(int argc, char ** argv)
                     src_code.write(
                         self.GRAPH_CPP_TEMPLATE.format(top_task_name=self.top)
                     )
-
+                with open(self.get_common_path(), "w", encoding="utf-8") as src_code:
+                    src_code.write(clang_format(task.code))
             else:
                 code_content = clang_format(task.code)
                 try:
@@ -614,6 +622,10 @@ int main(int argc, char ** argv)
                 ):
                     stdout, stderr = proc.communicate()
             elif flow_type == "aie":
+                if task.name != self.top:
+                    # For AIE flow, only the top-level task is synthesized
+                    return
+                assert platform is not None, "Platform must be specified for AIE flow."
                 assert platform is not None, "Platform must be specified for AIE flow."
                 with (
                     open(self.get_tar(task.name), "wb") as tarfileobj,

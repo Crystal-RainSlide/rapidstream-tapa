@@ -194,7 +194,8 @@ bool Visitor::VisitFunctionDecl(FunctionDecl* func) {
         // We deal with AIE and HLS differently.
         // For HLS, we reserve the function signature and remove the body.
         // For AIE, we remove the function signature and body.
-        current_target->ProcessNonCurrentTask(func, GetRewriter());
+        current_target->ProcessNonCurrentTask(func, GetRewriter(),
+                                              IsTapaTopLevel(current_task));
 
       } else if (is_upper_level_task) {
         auto task = GetTapaTask(func->getBody());
@@ -244,9 +245,21 @@ void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
   for (const auto param : func->parameters()) {
     const auto param_name = param->getNameAsString();
     auto add_mmap_meta = [&](const string& name) {
+      std::string cat;
+      if (IsTapaType(param, "mmap")) {
+        cat = "mmap";
+      } else if (IsTapaType(param, "immap")) {
+        cat = "immap";
+      } else if (IsTapaType(param, "ommap")) {
+        cat = "ommap";
+      } else if (IsTapaType(param, "async_mmap")) {
+        cat = "async_mmap";
+      } else {
+        cat = "unknown";
+      }
       metadata["ports"].push_back(
           {{"name", name},
-           {"cat", IsTapaType(param, "async_mmap") ? "async_mmap" : "mmap"},
+           {"cat", cat},
            {"width",
             GetTypeWidth(GetTemplateArg(param->getType(), 0)->getAsType())},
            {"type", GetMmapElemType(param) + "*"}});
