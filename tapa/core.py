@@ -128,6 +128,131 @@ STATE10 = IntConst("2'b10")
 MOD_DEF_IOS = []
 
 
+def gen_declarations(task: Task) -> tuple[list[str], list[str], list[str]]:
+    """Generates kernel and port declarations."""
+    port_decl = [f"input_gmio p_{port.name};" for port in task.ports.values()]
+    kernel_decl = [
+        f"kernel k_{name}{i};"
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+    header_decl = [f'#include "{name}.h"' for name in task.tasks]
+    return header_decl, kernel_decl, port_decl
+
+
+def gen_definitions(task: Task) -> tuple[list[str], ...]:
+    """Generates kernel and port definitions."""
+    kernel_def = [
+        f"k_{name}{i} = kernel::create({name});"
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+    kernel_source = [
+        f'source(k_{name}{i}) = "{name}.cpp";'
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+    kernel_header = [
+        f'headers(k_{name}{i}) = {{"{name}.h", "common.h"}};'
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+    kernel_runtime = [
+        f"runtime<radio>(k_{name}{i}) = OCCUPANCY;"
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+    kernel_loc = [
+        f"//location<kernel>(k_{name}{i}) = tile(X, X);"
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+
+    burst_size = 64  # 64 Bytes
+    throughput = 1000  # 1000MB/s
+    port_def = [
+        f"p_{port.name} = input_gmio::create"
+        f'("p_{port.name}", {burst_size}, {throughput});'
+        for port in task.ports.values()
+    ]
+    return (
+        kernel_def,
+        kernel_source,
+        kernel_header,
+        kernel_runtime,
+        kernel_loc,
+        port_def,
+    )
+
+
+def gen_connections(task: Task) -> list[str]:  # noqa: C901  # TODO: refactor this function
+    """Generates connections between ports and kernels."""
+    link_from_src = {}
+    link_to_dst = {}
+    for name, insts in task.tasks.items():
+        for i, inst in enumerate(insts):
+            arg_dict = inst["args"]
+            in_num = 0
+            out_num = 0
+            for conn_dict in arg_dict.values():
+                if conn_dict["cat"] == "istream":
+                    link_to_dst[conn_dict["arg"]] = [
+                        f"{name}{i}.in[{in_num}]",
+                        "net",
+                    ]
+                    in_num += 1
+                elif conn_dict["cat"] == "ostream":
+                    link_from_src[conn_dict["arg"]] = [
+                        f"{name}{i}.out[{out_num}]",
+                        "net",
+                    ]
+                    out_num += 1
+                elif conn_dict["cat"] == "immap":
+                    link_to_dst[conn_dict["arg"]] = [
+                        f"{name}{i}.in[{in_num}]",
+                        "io",
+                    ]
+                    in_num += 1
+                elif conn_dict["cat"] == "ommap":
+                    link_from_src[conn_dict["arg"]] = [
+                        f"{name}{i}.out[{out_num}]",
+                        "io",
+                    ]
+                    out_num += 1
+                else:
+                    msg = f"Unknown connection category: {conn_dict['cat']}"
+                    raise ValueError(msg)
+
+    connect_def = []
+    for name in task.fifos:
+        assert link_from_src[name][1] == "net", "FIFOs should be connected to/from net"
+        connect_def.append(
+            f"connect<stream> {name} (k_{link_from_src[name][0]},"
+            f" k_{link_to_dst[name][0]});"
+        )
+
+    for port in task.ports.values():
+        name = port.name
+        width = port.width
+        if name in link_from_src:
+            assert (
+                link_from_src[name][1] == "io"
+            ), "Ports should be connected to/from io"
+            connect_def.append(
+                f"connect<window<{width}>> {name}_link"
+                f" (k_{link_from_src[name][0]}, p_{name}.in[0]);"
+            )
+
+        if name in link_to_dst:
+            assert link_to_dst[name][1] == "io", "Ports should be connected to/from io"
+            connect_def.append(
+                f"connect<window<{width}>> {name}_link"
+                f" (p_{name}.out[0], k_{link_to_dst[name][0]});"
+            )
+
+    return connect_def
+
+
 class Program:  # noqa: PLR0904  # TODO: refactor this class
     """Describes a TAPA program.
 
@@ -142,6 +267,62 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
       vitis_mode: Whether the generated RTL should match Vitis XO requirements.
 
     """
+
+    GRAPH_HEADER_TEMPLATE = r"""
+#pragma once
+#include <adf.h>
+#include "common.h"
+#define OCCUPANCY 0.9
+{header__decl}
+using namespace adf;
+class {graph_name}: public graph
+{{
+private:
+    {kernel_decl}
+
+public:
+    {port_decl}
+
+    {graph_name}()
+	{{
+		// create kernel
+        {kernel_def}
+        {kernel_source}
+        {kernel_header}
+        {kernel_runtime}
+        {kernel_loc}
+
+		// create port
+        {port_def}
+
+		// connect port and kernel
+        {connect_def}
+	}};
+}};
+"""
+
+    GRAPH_CPP_TEMPLATE = r"""
+// Copyright 2024 RapidStream Design Automation, Inc.
+// All Rights Reserved.
+
+#include "{top_task_name}.h"
+
+using namespace adf;
+
+{top_task_name} my_graph;
+
+int main(int argc, char ** argv)
+{{
+	my_graph.init();
+#if defined(__X86SIM__)
+	my_graph.run(1);
+#else
+	my_graph.run();
+#endif
+	my_graph.end();
+	return 0;
+}}
+"""
 
     def __init__(
         self,
@@ -276,8 +457,11 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
     def get_task(self, name: str) -> Task:
         return self._tasks[name]
 
-    def get_cpp(self, name: str) -> str:
+    def get_cpp_path(self, name: str) -> str:
         return os.path.join(self.cpp_dir, name + ".cpp")
+
+    def get_header_path(self, name: str) -> str:
+        return os.path.join(self.cpp_dir, name + ".h")
 
     def get_tar(self, name: str) -> str:
         os.makedirs(os.path.join(self.work_dir, "tar"), exist_ok=True)
@@ -329,20 +513,43 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
         _logger.info("extracting %s C++ files", target)
         check_mmap_arg_name(list(self._tasks.values()))
 
+        top_aie_task_is_done = False
         for task in self._tasks.values():
-            code_content = clang_format(task.code)
-            try:
-                with open(self.get_cpp(task.name), encoding="utf-8") as src_code:
-                    if src_code.read() == code_content:
-                        _logger.debug(
-                            "not updating %s since its content is up-to-date",
-                            src_code.name,
-                        )
-                        continue
-            except FileNotFoundError:
-                pass
-            with open(self.get_cpp(task.name), "w", encoding="utf-8") as src_code:
-                src_code.write(code_content)
+            if task.name == self.top and target == "aie":
+                assert (
+                    top_aie_task_is_done is False
+                ), "There should be exactly one top-level task"
+                top_aie_task_is_done = True
+                code_content = self.get_aie_graph(task)
+                with open(
+                    self.get_header_path(task.name), "w", encoding="utf-8"
+                ) as src_code:
+                    src_code.write(code_content)
+                with open(
+                    self.get_cpp_path(task.name), "w", encoding="utf-8"
+                ) as src_code:
+                    src_code.write(
+                        self.GRAPH_CPP_TEMPLATE.format(top_task_name=self.top)
+                    )
+
+            else:
+                code_content = clang_format(task.code)
+                try:
+                    with open(
+                        self.get_cpp_path(task.name), encoding="utf-8"
+                    ) as src_code:
+                        if src_code.read() == code_content:
+                            _logger.debug(
+                                "not updating %s since its content is up-to-date",
+                                src_code.name,
+                            )
+                            continue
+                except FileNotFoundError:
+                    pass
+                with open(
+                    self.get_cpp_path(task.name), "w", encoding="utf-8"
+                ) as src_code:
+                    src_code.write(code_content)
         for name, content in self.headers.items():
             header_path = os.path.join(self.cpp_dir, name)
             os.makedirs(os.path.dirname(header_path), exist_ok=True)
@@ -412,7 +619,7 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
                     open(self.get_tar(task.name), "wb") as tarfileobj,
                     RunAie(
                         tarfileobj,
-                        kernel_files=[self.get_cpp(task.name)],
+                        kernel_files=[self.get_cpp_path(task.name)],
                         work_dir=f"{self.work_dir}/aie" if keep_hls_work_dir else None,
                         top_name=task.name,
                         clock_period=str(clock_period),
@@ -1373,3 +1580,31 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
                         f"{custom_rtl_ports}"
                     )
                     raise ValueError(msg)
+
+    def get_aie_graph(self, task: Task) -> str:
+        """Generates the complete AIE graph code."""
+
+        header_decl, kernel_decl, port_decl = gen_declarations(task)
+        (
+            kernel_def,
+            kernel_source,
+            kernel_header,
+            kernel_runtime,
+            kernel_loc,
+            port_def,
+        ) = gen_definitions(task)
+        connect_def = gen_connections(task)
+
+        return self.GRAPH_HEADER_TEMPLATE.format(
+            graph_name=self.top,
+            header__decl="\n".join(header_decl),
+            kernel_decl="\n\t".join(kernel_decl),
+            kernel_def="\n\t\t".join(kernel_def),
+            kernel_source="\n\t\t".join(kernel_source),
+            kernel_header="\n\t\t".join(kernel_header),
+            kernel_runtime="\n\t\t".join(kernel_runtime),
+            kernel_loc="\n\t\t".join(kernel_loc),
+            port_decl="\n\t".join(port_decl),
+            port_def="\n\t\t".join(port_def),
+            connect_def="\n\t\t".join(connect_def),
+        )

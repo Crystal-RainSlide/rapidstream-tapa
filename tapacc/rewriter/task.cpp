@@ -260,7 +260,8 @@ void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
             GetTypeWidth(GetTemplateArg(param->getType(), 0)->getAsType())},
            {"type", GetStreamElemType(param)}});
     };
-    if (IsTapaType(param, "(async_)?mmap")) {
+    if (IsTapaType(param, "(async_)?mmap") || IsTapaType(param, "immap") ||
+        IsTapaType(param, "ommap")) {
       add_mmap_meta(param_name);
     } else if (IsTapaType(param, "mmaps")) {
       for (int i = 0; i < GetArraySize(param); ++i) {
@@ -479,6 +480,18 @@ void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
             };
             if (IsTapaType(param, "mmap")) {
               param_cat = "mmap";
+              // vector invocation can map mmaps to mmap
+              register_arg(
+                  get_name(arg_name, mmaps_access_pos[arg_name]++, decl_ref));
+
+            } else if (IsTapaType(param, "immap")) {
+              param_cat = "immap";
+              // vector invocation can map mmaps to mmap
+              register_arg(
+                  get_name(arg_name, mmaps_access_pos[arg_name]++, decl_ref));
+
+            } else if (IsTapaType(param, "ommap")) {
+              param_cat = "ommap";
               // vector invocation can map mmaps to mmap
               register_arg(
                   get_name(arg_name, mmaps_access_pos[arg_name]++, decl_ref));
